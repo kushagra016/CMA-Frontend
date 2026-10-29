@@ -7,7 +7,7 @@ export default function App() {
 
   const fetchMemoryMap = async () => {
     try {
-      const response = await fetch('http://localhost:8080/api/memory-map');
+      const response = await fetch('https://cma-frontend-sadi.onrender.com/api/memory-map');
       const data = await response.json();
       setMaps(data);
     } catch (error) {
@@ -20,7 +20,7 @@ export default function App() {
 
     const loadMemoryMap = async () => {
       try {
-        const response = await fetch('http://localhost:8080/api/memory-map');
+        const response = await fetch('https://cma-frontend-sadi.onrender.com/api/memory-map');
         const data = await response.json();
         if (!cancelled) setMaps(data);
       } catch (error) {
@@ -34,7 +34,7 @@ export default function App() {
 
   const handleAllocate = async () => {
     try {
-      await fetch('http://localhost:8080/api/allocate', {
+      await fetch('https://cma-frontend-sadi.onrender.com/api/allocate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ val: parseFloat(val), unit: unit })
@@ -47,7 +47,7 @@ export default function App() {
 
   const handleDeallocate = async (id) => {
     try {
-      await fetch('http://localhost:8080/api/deallocate', {
+      await fetch('https://cma-frontend-sadi.onrender.com/api/deallocate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: id })
