@@ -1,3 +1,5 @@
+#include <cstdlib> // Required to read Environment Variables
+
 #include <iostream>
 #include <cstddef>
 #include <string>
@@ -427,6 +429,15 @@ int main() {
         res.set_content(response.dump(), "application/json");
     });
 
-    svr.listen("0.0.0.0", 8080);
+    // Cloud Port Configuration
+    int port = 8080; // Default for local testing
+    if (const char* env_p = std::getenv("PORT")) {
+        port = std::stoi(env_p);
+    }
+    
+    std::cout << "Starting cloud server on port " << port << "...\n";
+    svr.listen("0.0.0.0", port);
+    
     return 0;
+}
 }
