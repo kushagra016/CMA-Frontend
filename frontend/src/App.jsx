@@ -24,8 +24,8 @@ export default function App() {
     try {
       const [mapRes, analyticsRes] = await Promise.all([
         // Pass the current unit state to the backend
-        fetch(`http://localhost:8080/api/memory-map?unit=${unit}`),
-        fetch('http://localhost:8080/api/analytics')
+        fetch(`https://cma-frontend-1.onrender.com/api/memory-map?unit=${unit}`),
+        fetch('https://cma-frontend-1.onrender.com/api/analytics')
       ]);
       setMaps(await mapRes.json());
       setAnalytics(await analyticsRes.json());
@@ -48,7 +48,7 @@ export default function App() {
   const handleAllocate = async () => {
     try {
       addLog(`Requesting allocation: ${val} ${unit}...`, "info");
-      const response = await fetch('http://localhost:8080/api/allocate', {
+      const response = await fetch('https://cma-frontend-1.onrender.com/api/allocate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ val: parseFloat(val), unit: unit })
@@ -69,7 +69,7 @@ export default function App() {
   const handleDeallocate = async (id) => {
     try {
       addLog(`Initiating deallocation for Block ID: ${id}...`, "info");
-      await fetch('http://localhost:8080/api/deallocate', {
+      await fetch('https://cma-frontend-1.onrender.com/api/deallocate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: id })
