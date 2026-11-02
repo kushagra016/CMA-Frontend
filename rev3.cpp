@@ -1,5 +1,3 @@
-#include <cstdlib> // Required to read Environment Variables
-
 #include <iostream>
 #include <cstddef>
 #include <string>
@@ -7,45 +5,41 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <mutex>
 #include "httplib.h"
 #include "json.hpp"
+
 using json = nlohmann::json;
 
-// BlockHeader
-struct BlockHeader
-{
+bool suppressOutput = true; 
+
+// Hardware Alignment Helper
+size_t alignToWordBoundary(size_t bytes, size_t alignment = 8) {
+    return (bytes + alignment - 1) & ~(alignment - 1);
+}
+
+struct BlockHeader {
+    int uniqueId; // NEW: Bulletproof ID tracking
     size_t size;
+    size_t requestedSize;
     bool isFree;
     BlockHeader *next;
     BlockHeader *prev;
 };
 
-enum class AllocationStrategy
-{
-    FIRST_FIT,
-    BEST_FIT,
-    WORST_FIT
-};
+enum class AllocationStrategy { FIRST_FIT, BEST_FIT, WORST_FIT };
 
-size_t convertToBytes(double value, std::string unit)
-{
-    if (unit == "KB")
-        return static_cast<size_t>(value * 1024);
-    if (unit == "MB")
-        return static_cast<size_t>(value * 1024 * 1024);
-    if (unit == "GB")
-        return static_cast<size_t>(value * 1024 * 1024 * 1024);
+size_t convertToBytes(double value, std::string unit) {
+    if (unit == "KB") return static_cast<size_t>(value * 1024);
+    if (unit == "MB") return static_cast<size_t>(value * 1024 * 1024);
+    if (unit == "GB") return static_cast<size_t>(value * 1024 * 1024 * 1024);
     return static_cast<size_t>(value);
 }
 
-double convertFromBytes(size_t bytes, std::string unit)
-{
-    if (unit == "KB")
-        return static_cast<double>(bytes) / 1024.0;
-    if (unit == "MB")
-        return static_cast<double>(bytes) / (1024.0 * 1024.0);
-    if (unit == "GB")
-        return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+double convertFromBytes(size_t bytes, std::string unit) {
+    if (unit == "KB") return static_cast<double>(bytes) / 1024.0;
+    if (unit == "MB") return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    if (unit == "GB") return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
     return static_cast<double>(bytes);
 }
 
@@ -56,76 +50,68 @@ struct AllocationRecord {
 };
 std::vector<AllocationRecord> allocatedPointers;
 
-class MemoryAllocator
-{
+class MemoryAllocator {
 private:
     void *memoryPool;
     size_t totalSize;
     BlockHeader *head;
+    BlockHeader *firstFreeBlock; 
     std::string strategyName;
+    std::mutex arenaMutex;
 
 public:
-    MemoryAllocator(size_t size, std::string name)
-    {
+    MemoryAllocator(size_t size, std::string name) {
         totalSize = size;
         strategyName = name;
         memoryPool = ::operator new(totalSize);
         head = static_cast<BlockHeader *>(memoryPool);
 
+        head->uniqueId = 0; 
         head->size = totalSize - sizeof(BlockHeader);
+        head->requestedSize = 0; 
         head->isFree = true;
         head->next = nullptr;
         head->prev = nullptr;
+
+        firstFreeBlock = head; 
     }
 
-    ~MemoryAllocator()
-    {
+    ~MemoryAllocator() {
         ::operator delete(memoryPool);
     }
 
-    void *allocate(size_t size, AllocationStrategy strategy)
-    {
-        if (size == 0)
-            return nullptr;
+    void *allocate(size_t rawSize, AllocationStrategy strategy, int newId) {
+        std::lock_guard<std::mutex> lock(arenaMutex); 
+        
+        if (rawSize == 0) return nullptr;
 
-        BlockHeader *current = head;
+        size_t alignedSize = alignToWordBoundary(rawSize);
+        BlockHeader *current = (strategy == AllocationStrategy::FIRST_FIT) ? firstFreeBlock : head; 
         BlockHeader *selectedBlock = nullptr;
 
-        // Searching Logic
-        if (strategy == AllocationStrategy::FIRST_FIT)
-        {
-            while (current != nullptr)
-            {
-                if (current->isFree && current->size >= size)
-                {
+        if (strategy == AllocationStrategy::FIRST_FIT) {
+            while (current != nullptr) {
+                if (current->isFree && current->size >= alignedSize) {
                     selectedBlock = current;
                     break;
                 }
                 current = current->next;
             }
         }
-        else if (strategy == AllocationStrategy::BEST_FIT)
-        {
-            while (current != nullptr)
-            {
-                if (current->isFree && current->size >= size)
-                {
-                    if (selectedBlock == nullptr || current->size < selectedBlock->size)
-                    {
+        else if (strategy == AllocationStrategy::BEST_FIT) {
+            while (current != nullptr) {
+                if (current->isFree && current->size >= alignedSize) {
+                    if (selectedBlock == nullptr || current->size < selectedBlock->size) {
                         selectedBlock = current;
                     }
                 }
                 current = current->next;
             }
         }
-        else if (strategy == AllocationStrategy::WORST_FIT)
-        {
-            while (current != nullptr)
-            {
-                if (current->isFree && current->size >= size)
-                {
-                    if (selectedBlock == nullptr || current->size > selectedBlock->size)
-                    {
+        else if (strategy == AllocationStrategy::WORST_FIT) {
+            while (current != nullptr) {
+                if (current->isFree && current->size >= alignedSize) {
+                    if (selectedBlock == nullptr || current->size > selectedBlock->size) {
                         selectedBlock = current;
                     }
                 }
@@ -133,219 +119,128 @@ public:
             }
         }
 
-        if (selectedBlock == nullptr)
-        {
-            return nullptr;
-        }
+        if (selectedBlock == nullptr) return nullptr;
 
-        // Merging & Spliting Logic
-        if (selectedBlock->size >= size + sizeof(BlockHeader) + 1)
-        {
-            char *newBlockAddress = reinterpret_cast<char *>(selectedBlock) + sizeof(BlockHeader) + size;
+        if (selectedBlock->size >= alignedSize + sizeof(BlockHeader) + 1) {
+            char *newBlockAddress = reinterpret_cast<char *>(selectedBlock) + sizeof(BlockHeader) + alignedSize;
             BlockHeader *newBlock = reinterpret_cast<BlockHeader *>(newBlockAddress);
 
-            newBlock->size = selectedBlock->size - size - sizeof(BlockHeader);
+            newBlock->size = selectedBlock->size - alignedSize - sizeof(BlockHeader);
+            newBlock->requestedSize = 0;
+            newBlock->uniqueId = 0;
             newBlock->isFree = true;
             newBlock->next = selectedBlock->next;
             newBlock->prev = selectedBlock;
 
-            if (newBlock->next != nullptr)
-            {
-                newBlock->next->prev = newBlock;
-            }
+            if (newBlock->next != nullptr) newBlock->next->prev = newBlock;
 
-            selectedBlock->size = size;
+            selectedBlock->size = alignedSize;
             selectedBlock->next = newBlock;
         }
 
         selectedBlock->isFree = false;
+        selectedBlock->requestedSize = rawSize; 
+        selectedBlock->uniqueId = newId; // Assign exact ID
+
+        if (selectedBlock == firstFreeBlock) {          
+            BlockHeader* temp = firstFreeBlock->next;
+            while (temp != nullptr && !temp->isFree) temp = temp->next;
+            firstFreeBlock = temp;
+        }
+        
         return static_cast<void *>(selectedBlock + 1);
     }
 
-    void deallocate(void *ptr)
-    {
-        if (ptr == nullptr)
-            return;
+    void deallocate(void *ptr) {
+        if (ptr == nullptr) return;
 
+        std::lock_guard<std::mutex> lock(arenaMutex); 
         BlockHeader *current = static_cast<BlockHeader *>(ptr) - 1;
+        
         current->isFree = true;
+        current->requestedSize = 0;
+        current->uniqueId = 0; // Clear ID on free
 
-        if (current->next != nullptr && current->next->isFree)
-        {
+        if (current->next != nullptr && current->next->isFree) {
             current->size += sizeof(BlockHeader) + current->next->size;
             current->next = current->next->next;
-            if (current->next != nullptr)
-            {
-                current->next->prev = current;
-            }
+            if (current->next != nullptr) current->next->prev = current;
         }
 
-        if (current->prev != nullptr && current->prev->isFree)
-        {
+        if (current->prev != nullptr && current->prev->isFree) {
             current->prev->size += sizeof(BlockHeader) + current->size;
             current->prev->next = current->next;
-            if (current->next != nullptr)
-            {
-                current->next->prev = current->prev;
-            }
+            if (current->next != nullptr) current->next->prev = current->prev;
+            current = current->prev; 
+        }
+
+        if (firstFreeBlock == nullptr || current < firstFreeBlock) {   
+            firstFreeBlock = current;
         }
     }
-
-    void *getPointerFromBlockId(int targetId)
-    {
-        BlockHeader *current = head;
-        int currentId = 1;
-        while (current != nullptr)
-        {
-            if (currentId == targetId)
-            {
-                if (current->isFree)
-                    return nullptr;
-                return static_cast<void *>(current + 1);
+    
+    void* getPointerByUniqueId(int targetId) {
+        std::lock_guard<std::mutex> lock(arenaMutex);
+        BlockHeader* current = head;
+        while (current != nullptr) {
+            if (current->uniqueId == targetId && !current->isFree) {
+                return static_cast<void*>(current + 1);
             }
-            currentId++;
             current = current->next;
         }
         return nullptr;
     }
 
-    void printActiveBlockIds()
-    {
-        BlockHeader *current = head;
-        int id = 1;
-        bool hasActive = false;
-        std::cout << "Currently active Block IDs: ";
-
-        while (current != nullptr)
-        {
-            if (!current->isFree)
-            {
-                std::cout << id << " ";
-                hasActive = true;
-            }
-            id++;
-            current = current->next;
-        }
-
-        if (!hasActive)
-            std::cout << "None";
-        std::cout << "\n";
-    }
-
-    void printMemoryMap(std::string unit)
-    {
-        BlockHeader *current = head;
-        std::cout << "\n=== " << strategyName << " Map (" << unit << ") ===\n";
-
-        int id = 1;
-        size_t totalFreeBytes = 0;
-        size_t totalUsedBytes = 0;
-
-        while (current != nullptr)
-        {
-            std::cout << "[ID: " << id << " | ";
-            if (current->isFree)
-            {
-                std::cout << "FREE";
-                totalFreeBytes += current->size;
-            }
-            else
-            {
-                std::cout << "USED";
-                totalUsedBytes += current->size;
-            }
-
-            double displaySize = convertFromBytes(current->size, unit);
-            std::cout << ": " << std::fixed << std::setprecision(2) << displaySize << " " << unit << "] ";
-
-            if (current->next != nullptr)
-            {
-                std::cout << "-> ";
-            }
-
-            id++;
-            current = current->next;
-        }
-
-        std::cout << "\n\nBlocks: " << (id - 1)
-                  << " | Used: " << std::fixed << std::setprecision(2) << convertFromBytes(totalUsedBytes, unit) << " " << unit
-                  << " | Free: " << std::fixed << std::setprecision(2) << convertFromBytes(totalFreeBytes, unit) << " " << unit << "\n";
-    }
-
-    json getMemoryMapJson(const std::string &unit)
-    {
+    json getMemoryMapJson(const std::string &unit) {
+        std::lock_guard<std::mutex> lock(arenaMutex);
         BlockHeader *current = head;
         json mapArray = json::array();
-        int id = 1;
 
-        while (current != nullptr)
-        {
+        while (current != nullptr) {
             json block;
-            block["id"] = id;
+            block["id"] = current->uniqueId; 
             block["status"] = current->isFree ? "FREE" : "USED";
             block["sizeBytes"] = current->size;
             block["displaySize"] = convertFromBytes(current->size, unit);
             block["unit"] = unit;
-
             mapArray.push_back(block);
-            id++;
             current = current->next;
         }
         return mapArray;
     }
 
-    void printSummaryTable(std::string unit)
-    {
+    json getAnalyticsJson() {
+        std::lock_guard<std::mutex> lock(arenaMutex);
         BlockHeader *current = head;
+        size_t totalFreeBytes = 0, totalUsedBytes = 0, largestFreeBlock = 0;
         int blockCount = 0;
-        size_t totalFreeBytes = 0;
-        size_t totalUsedBytes = 0;
 
-        while (current != nullptr)
-        {
-            if (current->isFree)
-            {
+        while (current != nullptr) {
+            if (current->isFree) {
                 totalFreeBytes += current->size;
-            }
-            else
-            {
+                if (current->size > largestFreeBlock) largestFreeBlock = current->size;
+            } else {
                 totalUsedBytes += current->size;
             }
             blockCount++;
             current = current->next;
         }
 
-        std::cout << "+-------------------------------------------------+\n";
-        std::cout << "| " << std::left << std::setw(47) << (strategyName + " SUMMARY") << " |\n";
-        std::cout << "+-------------------------------------------------+\n";
-        std::cout << std::fixed << std::setprecision(2);
-
-        std::cout << "| Total Pool Size:       "
-                  << std::right << std::setw(17) << convertFromBytes(totalSize, unit)
-                  << " " << std::left << std::setw(7) << unit
-                  << std::right << "|\n";
-
-        std::cout << "| Total Used Memory:     "
-                  << std::right << std::setw(17) << convertFromBytes(totalUsedBytes, unit)
-                  << " " << std::left << std::setw(7) << unit
-                  << std::right << "|\n";
-
-        std::cout << "| Total Free Memory:     "
-                  << std::right << std::setw(17) << convertFromBytes(totalFreeBytes, unit)
-                  << " " << std::left << std::setw(7) << unit
-                  << std::right << "|\n";
-
-        std::cout << "| Total Blocks:          "
-                  << std::right << std::setw(17) << blockCount
-                  << " " << std::left << std::setw(7) << " "
-                  << std::right << "|\n";
-
-        std::cout << "+-------------------------------------------------+\n\n";
+        double externalFrag = (totalFreeBytes > 0) ? (static_cast<double>(totalFreeBytes - largestFreeBlock) / totalFreeBytes) * 100.0 : 0.0;
+        json stats;
+        stats["externalFrag"] = externalFrag;
+        stats["totalBlocks"] = blockCount;
+        return stats;
     }
 };
 
+MemoryAllocator* globalAllocator = nullptr;
+AllocationStrategy globalStrategy = AllocationStrategy::FIRST_FIT;
+std::mutex webRoutingMutex; 
+int globalAllocationCounter = 1;
+
 int main() {
-    std::cout << "Initializing Multi-Strategy Memory Server on http://localhost:8080...\n";
+    std::cout << "Initializing Stabilized Server on http://localhost:8080...\n";
     
     size_t poolSize = 10 * 1024 * 1024; // 10MB Pool
     MemoryAllocator allocFirst(poolSize, "FIRST-FIT STRATEGY");
@@ -354,8 +249,6 @@ int main() {
 
     httplib::Server svr;
 
-    // FIX 1: The CORS Preflight Handler
-    // This catches the browser's security check and gives React permission to send POST requests
     svr.Options(".*", [&](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -363,19 +256,33 @@ int main() {
         res.status = 200;
     });
 
-    // Endpoint 1: Get ALL Memory Maps
     svr.Get("/api/memory-map", [&](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*"); 
         
+        // Read the requested unit from the query parameter (e.g., ?unit=MB)
+        // Default to KB if the parameter is missing
+        std::string requestedUnit = "KB";
+        if (req.has_param("unit")) {
+            requestedUnit = req.get_param_value("unit");
+        }
+        
         json response;
-        response["firstFit"] = allocFirst.getMemoryMapJson("KB");
-        response["bestFit"] = allocBest.getMemoryMapJson("KB");
-        response["worstFit"] = allocWorst.getMemoryMapJson("KB");
+        response["firstFit"] = allocFirst.getMemoryMapJson(requestedUnit);
+        response["bestFit"] = allocBest.getMemoryMapJson(requestedUnit);
+        response["worstFit"] = allocWorst.getMemoryMapJson(requestedUnit);
         
         res.set_content(response.dump(), "application/json");
     });
 
-    // Endpoint 2: Allocate Memory
+    svr.Get("/api/analytics", [&](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*"); 
+        json response;
+        response["firstFit"] = allocFirst.getAnalyticsJson();
+        response["bestFit"] = allocBest.getAnalyticsJson();
+        response["worstFit"] = allocWorst.getAnalyticsJson();
+        res.set_content(response.dump(), "application/json");
+    });
+
     svr.Post("/api/allocate", [&](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         json reqData = json::parse(req.body);
@@ -384,15 +291,23 @@ int main() {
         std::string unit = reqData["unit"];
         size_t requestedBytes = convertToBytes(val, unit);
         
-        void* ptrF = allocFirst.allocate(requestedBytes, AllocationStrategy::FIRST_FIT);
-        void* ptrB = allocBest.allocate(requestedBytes, AllocationStrategy::BEST_FIT);
-        void* ptrW = allocWorst.allocate(requestedBytes, AllocationStrategy::WORST_FIT);
+        void *ptrF = nullptr, *ptrB = nullptr, *ptrW = nullptr;
+
+        {
+            std::lock_guard<std::mutex> routeLock(webRoutingMutex);
+            int currentId = globalAllocationCounter++; 
+            
+            ptrF = allocFirst.allocate(requestedBytes, AllocationStrategy::FIRST_FIT, currentId);
+            ptrB = allocBest.allocate(requestedBytes, AllocationStrategy::BEST_FIT, currentId);
+            ptrW = allocWorst.allocate(requestedBytes, AllocationStrategy::WORST_FIT, currentId);
+        }
         
         json response;
         if (ptrF && ptrB && ptrW) {
             allocatedPointers.push_back({ptrF, ptrB, ptrW});
             response["status"] = "SUCCESS";
         } else {
+            std::lock_guard<std::mutex> routeLock(webRoutingMutex);
             if (ptrF) allocFirst.deallocate(ptrF);
             if (ptrB) allocBest.deallocate(ptrB);
             if (ptrW) allocWorst.deallocate(ptrW);
@@ -401,27 +316,26 @@ int main() {
         res.set_content(response.dump(), "application/json");
     });
 
-    // Endpoint 3: Deallocate Memory
     svr.Post("/api/deallocate", [&](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         json reqData = json::parse(req.body);
-        int targetId = reqData["id"]; // The positional grid ID sent from React
+        int targetId = reqData["id"]; 
         
         json response;
         response["status"] = "FAILED";
 
-        // FIX 2: Translate the UI's positional ID into the actual physical memory pointer
-        void* primaryPtr = allocFirst.getPointerFromBlockId(targetId);
+        void* primaryPtr = allocFirst.getPointerByUniqueId(targetId);
 
         if (primaryPtr) {
-            // Locate that pointer in our global tracker to safely free it across all 3 strategies
             auto it = std::find_if(allocatedPointers.begin(), allocatedPointers.end(),
                 [&](const AllocationRecord& rec) { return rec.firstFitPtr == primaryPtr; });
 
             if (it != allocatedPointers.end()) {
+                std::lock_guard<std::mutex> routeLock(webRoutingMutex);
                 allocFirst.deallocate(it->firstFitPtr);
                 allocBest.deallocate(it->bestFitPtr);
                 allocWorst.deallocate(it->worstFitPtr);
+                
                 allocatedPointers.erase(it);
                 response["status"] = "SUCCESS";
             }
